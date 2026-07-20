@@ -1,0 +1,77 @@
+# Lightweight verification for the Windows Go FFI cdylib build (fork-only,
+# not part of PR #1187). Builds microsandbox-go on Windows msvc runners for
+# amd64 and arm64, stages the dll under the unified bundle asset name, and
+# asserts it is a non-trivial PE. No tag push, no release, no publish.
+name: Verify Windows Go FFI
+
+on:
+  push:
+    branches: [ci/verify-windows-go]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  build-go-windows:
+    name: Build Go FFI (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows-x86_64
+            runner: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            vs_arch: amd64
+            vs_host_arch: amd64
+            go_arch: amd64
+          - target: windows-aarch64
+            runner: windows-11-arm
+            rust_target: aarch64-pc-windows-msvc
+            vs_arch: arm64
+            vs_host_arch: arm64
+            go_arch: arm64
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Build microsandbox-go
+        shell: pwsh
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          $ErrorActionPreference = "Stop"
+          . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
+          Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
+          cargo build --release -p microsandbox-go --target ${{ matrix.rust_target }}
+
+      - name: Stage and verify dll
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          $src = "target\${{ matrix.rust_target }}\release\microsandbox_go_ffi.dll"
+          $dst = "artifacts\libmicrosandbox_go_ffi-windows-${{ matrix.go_arch }}.dll"
+          Copy-Item $src $dst -Force
+          $len = (Get-Item $dst).Length
+          Write-Host "staged $dst ($len bytes)"
+          if ($len -lt 100000) { throw "dll unexpectedly small ($len bytes)" }
+          $magic = [System.IO.File]::ReadAllBytes($dst)[0..1]
+          if ($magic[0] -ne 0x4D -or $magic[1] -ne 0x5A) { throw "not a PE image (missing MZ magic)" }
+          Write-Host "OK: PE dll, name matches the bundle asset convention"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: go-ffi-${{ matrix.target }}
+          path: artifacts/libmicrosandbox_go_ffi-windows-${{ matrix.go_arch }}.dll
